@@ -1,5 +1,5 @@
 package com.esen.eqf.action.email;
-错误
+
 import com.esen.eacl.api.login.Login;
 import com.esen.eacl.api.permission.BatchPmCheckerResult;
 import com.esen.eacl.api.permission.PmCheckerApiService;
