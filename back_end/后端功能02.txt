@@ -1,0 +1,264 @@
+package com.esen.eqf.action.email;
+
+import com.esen.eacl.api.login.Login;
+import com.esen.eacl.api.permission.BatchPmCheckerResult;
+import com.esen.eacl.api.permission.PmCheckerApiService;
+import com.esen.eacl.api.permission.PmCheckerParams;
+import com.esen.eacl.api.permission.PmCheckerResult;
+import com.esen.eacl.api.user.UserApiService;
+import com.esen.eacl.api.user.UserEntity;
+import com.esen.ejdbc.params.PageRequest;
+import com.esen.elog.api.LogService;
+import com.esen.elog.api.LoggerFactory;
+import com.esen.elog.api.log.Log;
+import com.esen.eqf.FormServer;
+import com.esen.eqf.api.resource.FormResourceConst;
+import com.esen.eqf.db.FormDb;
+import com.esen.eqf.db.FormPageDb;
+import com.esen.eqf.db.field.SysField;
+import com.esen.eqf.db.field.WidgetFieldConfig;
+import com.esen.eqf.form.FormPage;
+import com.esen.eqf.form.FormPageTool;
+import com.esen.eqf.form.widget.WidgetFormCustom;
+import com.esen.eqf.form.widget.WidgetObject;
+import com.esen.eqf.operation.EqfEmailOperation;
+import com.esen.eservice.result.RestResultInfo;
+import com.esen.esysmgr.api.email.EmailEntity;
+import com.esen.esysmgr.api.email.EmailServiceFactory;
+import com.esen.esysmgr.api.email.service.EmailApiService;
+import com.esen.eutil.util.StrFunc;
+import com.esen.eutil.util.i18n.I18N;
+import com.esen.eutil.util.security.SecurityFunc;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.json.JSONObject;
+import org.slf4j.Logger;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.ResponseBody;
+
+import javax.servlet.http.HttpServletRequest;
+import java.io.File;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+/**
+ * 表单的邮箱发送服务
+ * @author wangshuai
+ * @since 2022/12/13 15:33
+ */
+@Controller
+@RequestMapping("/eqf")
+public class ActionEmailSend {
+
+  @Autowired
+  private EmailServiceFactory factory;
+
+  @Autowired
+  UserApiService userApiService;
+
+  @Autowired
+  PmCheckerApiService pmCheckerApiService;
+
+  /**
+   * 程序日志
+   */
+  private static final Logger log = LoggerFactory.getLogger(ActionEmailSend.class);
+
+  private  DateTimeFormatter dateTimeFormatter = DateTimeFormatter.ofPattern(StrFunc.FULL_DATE);
+  @Autowired
+  LogService logService;
+
+
+  /**
+   * 检查拥有表单填报权限的用户是否在当前报表期填报了数据，未填报则发送邮件
+   *
+   * 功能设计：
+   * 先给user1和user2 分配表单a的填报权限；表单a里设置了报表期字段，假设设置的是月报。user1在2022.12月进行了填报，而user2未填报。
+   * 如果现在2022.12.20 16:00 计划任务执行了，就会去看表单a是年报、月报、日报的哪一种，因为是月报，所以就去看2022.12月这个报表期哪些拥有表单a填报权限的用户没有填报数据。
+   * 然后就发现了user1有数据，user2没数据，所以给user2发邮件
+   *
+   * 设计上是，当计划任务执行时，会根据执行时间和对应表单报表期类型进行审查。
+   * 比如计划任务执行时间是2022.12.20 16:00，如果表单报表期是日报，就会查看2022.12.20的数据；如果表单是月报就会查看2022.12的数据；表单是年报就会查看2022的数据
+   * 如果计划任务执行时间是2023.1.2 15：00，对应的就是查2023.1.2、2023.1、2023的数据
+   * 也就是当前期是根据计划任务触发时间来算出来的，计划任务触发时间是用户自己配置的
+   * @param formIds
+   * @param emailTheme
+   * @param emailContent
+   * @throws Exception
+   */
+  public void sendEmail(String formIds, String emailTheme, String emailContent) throws Exception {
+    //传入的表单id序列
+   String[] formIdsArray = formIds.split(",");
+
+   log.debug("SendEmail开始催报功能---------");
+    //获取所有用户
+    List<UserEntity> result = userApiService.findAll(new PageRequest(-1, -1)).getResult();
+    //表单的资源前缀
+    String preStr="EQF$3$";
+    //记录每个表单有哪些用户是有填报权限的
+    HashMap<String, ArrayList<UserEntity>> record = new HashMap<>();
+    result.forEach(user->{
+      Login login = new Login();
+      login.setLoginId(user.getUserId());
+      ArrayList<PmCheckerParams> pmCheckerParams = new ArrayList<>();
+      Arrays.stream(formIdsArray).forEach(formId->{
+        PmCheckerParams params= new PmCheckerParams(preStr+formId, FormResourceConst.OPER_ADDREPORT);
+        //登陆对象改为当前遍历到的user
+        params.setLogin(login);
+        pmCheckerParams.add(params);
+      });
+      BatchPmCheckerResult batchPmCheckerResult = pmCheckerApiService.batchCheckPm(pmCheckerParams);
+      ArrayList<PmCheckerResult> batchPmCheckerResultList = batchPmCheckerResult.getBatchPmCheckerResult();
+      batchPmCheckerResultList.forEach(pmResult->{
+        //如果存在权限
+        if (pmResult.getResultList().get(0)) {
+          String resourceId = pmResult.getResourceId();
+          ArrayList<UserEntity> userEntities = record.computeIfAbsent(resourceId, key -> new ArrayList<UserEntity>());
+          userEntities.add(user);
+        }
+      });
+    });
+
+
+    //日报值 如2022-12-20 00:00:00
+    String dayBbq = LocalDateTime.now().withHour(0).withMinute(0).withSecond(0).format(dateTimeFormatter);
+    //月报值 如2022-12-01 00:00:00
+    String monthBbq = LocalDateTime.now().withHour(0).withMinute(0).withSecond(0).withDayOfMonth(1).format(dateTimeFormatter);
+    //年报值 如2022-01-01 00:00:00
+    String yearBbq = LocalDateTime.now().withHour(0).withMinute(0).withSecond(0).withMonth(1).withDayOfMonth(1).format(dateTimeFormatter);
+
+    for (String formId : formIdsArray) {
+      String resourceKey=preStr+formId;
+      //拥有当前表单填报权限的用户列表
+      ArrayList<UserEntity> userEntities = record.get(resourceKey);
+      if (userEntities == null || userEntities.size() == 0) {
+        //没有可催报的用户，直接跳到下一个表单
+        continue;
+      }
+      log.debug("SendEmail对"+formId+"表单进行催报");
+
+      //找到报表期有关的数据库表
+      FormPage formPage = FormPageTool.createFormPageFromId(formId);
+      String ds = formPage.getDs();
+      //先找到报表期字段所在的表和对用的字段
+      HashMap<String, WidgetObject> widgetsMap = formPage.getChildNodes();
+      JSONObject resultObj = new JSONObject();
+      findRptFieldNameAndTableName(widgetsMap, resultObj);
+      String reportTableName = resultObj.optString("reportTableName");
+      String reportFieldName = resultObj.optString("reportFieldName");
+      if (StrFunc.isNull(reportFieldName)){
+        //不存在报表期字段的表单不进行催报处理
+        continue;
+      }
+      String datetype = resultObj.optString("datetype");
+      //找准报表期所在的库表
+      FormPageDb formPageDb = formPage.getFormPageDb();
+      LinkedHashMap<String, FormDb> formDbs = (LinkedHashMap<String, FormDb>) formPageDb.getFormDbs();
+      if (StrFunc.isNull(reportTableName)) {
+        reportTableName = formDbs.get("DEFAULT").getTableName();
+      }
+      //sys表用于知道数据是哪个用户提交的
+      String sysTableName = formPageDb.getSysFormDb().getTableName();
+
+      //获取当前用于判断的报表期参数的对应值
+      String bbqStr="";
+      log.debug("SendEmail报表期字段类型是"+datetype);
+      if (StrFunc.strEquals(datetype, "year-month-day")) {
+        bbqStr = dayBbq;
+      } else if (StrFunc.strEquals(datetype, "year-month")) {
+        bbqStr =monthBbq;
+      } else if (StrFunc.strEquals(datetype, "year")) {
+        bbqStr = yearBbq;
+      }else {
+        //对于非年报、日报、月报 情况进行跳过
+        continue;
+      }
+
+      //拼接sql,例如SELECT SUBMITER_ FROM bbqwt_default def LEFT JOIN bbqwt_sys sys ON def.DATAID_ = sys.DATAID_ WHERE def.RQSJ_ = '2022-12-20 00:00:00'
+      StringBuffer sql = new StringBuffer();
+      sql.append("SELECT ").append(SysField.FIELD_SUBMITER.getName()).append(" FROM ").append(reportTableName)
+          .append(" def LEFT JOIN ").append(sysTableName).append(" sys ON def.").append(SysField.FIELD_DATAID.getName())
+          .append(" = sys.").append(SysField.FIELD_DATAID.getName()).append(" WHERE ").append("def.").append(reportFieldName)
+          .append(" = '").append(bbqStr).append("'");
+      log.debug("SendEmail查询当前报表期已填报用户的sql："+sql.toString());
+      //获取已经在当前报表期提交了的用户
+      ArrayList<String> submitUsers = new ArrayList<>();
+      try (Connection conn = FormServer.getInstance().getConnection(ds)) {
+        try (PreparedStatement pstm = conn.prepareStatement(sql.toString())) {
+          try (ResultSet res = pstm.executeQuery()) {
+            while (res.next()) {
+              submitUsers.add(res.getString(1));
+            }
+          }
+        }
+      }
+
+      log.debug("SendEmail已填报用户："+ String.join(",",submitUsers));
+      //找到没有进行提交的用户
+      ArrayList<String> emails = new ArrayList<>();
+      userEntities.forEach(userEntity -> {
+        String userId = userEntity.getUserId();
+        if (!submitUsers.contains(userId)){
+          //当前用户未在报表期内填写表单
+          String email = userEntity.getEmail();
+          if(!StrFunc.isNull(email)){
+            //用户邮箱不为空时需要发送催报邮件
+            emails.add(email);
+          }
+        }
+      });
+
+      //发送邮件
+      if (emails.size()!=0){
+        sendEmailByParams(String.join(",", emails), emailTheme, emailContent);
+      }
+    }
+    log.debug("SendEmail结束催报功能---------");
+  }
+
+  public void sendEmailByParams(String emailTo, String emailTheme, String emailContent) {
+    EmailEntity emailEntity = new EmailEntity(emailTo, emailTheme, emailContent, (File[]) null);
+    //获取邮件发送服务
+    EmailApiService emailApiService = factory.getDefaultService();
+    //发送邮件
+    log.debug("SendEmail-给" + emailTo + "发送邮件");
+    emailApiService.sendEmail(emailEntity, EqfEmailOperation.SEND_EMAIL);
+  }
+
+  /**
+   * 获取报表期字段和其所在的物理表名
+   * @param widgetsMap
+   * @param result
+   */
+  public static void findRptFieldNameAndTableName(HashMap<String, WidgetObject> widgetsMap, JSONObject result) {
+    String reportFieldName = "", reportTableName = "";
+    for (String key : widgetsMap.keySet()) {
+      WidgetObject widget = widgetsMap.get(key);
+      String reportperiod = widget.getOption("reportperiod");
+      if (StrFunc.parseBoolean(reportperiod, false)) {
+        WidgetFormCustom wfc = (WidgetFormCustom) widget;
+        List<WidgetFieldConfig> configList = wfc.getFieldConfig();
+        WidgetFieldConfig widgetConfig = configList.get(0);
+        reportFieldName = widgetConfig.getItem(0).getFldname();
+        reportTableName = widgetConfig.getTableName() != null ? widgetConfig.getTableName() : "";
+        result.put("datetype", widget.getOption("datetype"));
+        result.put("reportFieldName", reportFieldName);
+        result.put("reportTableName", reportTableName);
+        break;
+      }
+      if (StrFunc.isNull(reportTableName) && StrFunc.isNull(reportFieldName)) {
+        HashMap<String, WidgetObject> childWidgetMap = widget.getChildNodes();
+        if (childWidgetMap.size() > 0) {
+          findRptFieldNameAndTableName(childWidgetMap, result);
+        }
+      } else {
+        break;
+      }
+    }
+  }
+}
