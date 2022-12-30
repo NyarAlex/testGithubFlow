@@ -1,0 +1,152 @@
+import $ from "_jquery@3.6.0@jquery";
+import jQuery from 'jquery'
+import 'bootstrap/dist/css/bootstrap.min.css';
+import '../../css/public.css'
+import '../../css/selectBar.css'
+import '../../css/monitor/bibUsage.css';
+import axios from "../../js/axios";
+import selectRender from '../../logviewSelect.art';
+import paginationRender from '../../pagination.art'
+import bibTableRender from '../../monitor_bibUsage_table.art'
+import left_barRender from '../../left_bar.art'
+import dateFormat from "../../js/dateFormat";
+import betterScroll from "../../js/betterScroll";
+
+
+window.maxPage = 0
+let selectList = [];
+$(function () {
+	$(`#btnSearch`).change(e => {
+		searchLeftBtn($(`#btnSearch`).val())
+	})
+	getBibIdList()
+	window.leftScroll = betterScroll('.left');
+})
+
+function searchLeftBtn(val) {
+	console.log(val.length, val.length === 0)
+	if (val.length === 0) {
+		$(`#bibList`).html(left_barRender({btnList: selectList}))
+		bindBibList()
+		return;
+	}
+	let showList = []
+	selectList.forEach(item => {
+		console.log(item)
+		if (item.val.indexOf(val) !== -1) {
+			showList.push(item)
+		}
+	})
+	$(`#bibList`).html(left_barRender({btnList: showList}))
+	leftScroll.refresh()
+	bindBibList()
+
+}
+
+function getBibIdList() {
+	axios.get(`${publicUrl}/monitor/bib/list`).then(res => {
+		let list = res.data.data
+		selectList = [];
+		list.sort((a, b) => a.split('_')[2] - b.split('_')[2])
+		for (let i = 0; i < list.length; i++) {
+			selectList.push({
+				id: list[i],
+				val: list[i],
+				label: list[i]
+			})
+		}
+		const bibSelect = {
+			name: 'bibSelect',
+			col: 3,
+			data: selectList,
+			label: 'BIB ID',
+			show: true
+		}
+		$(`#bibList`).html(left_barRender({btnList: selectList}))
+		bindBibList()
+		setNewSelect('bib-select', bibSelect)
+		$("#bibList li:first-child").click()
+	})
+}
+
+function bindBibList() {
+	$("#bibList li").click((e) => {
+		$("#bibList li").removeClass('active')
+		$(e.target).addClass('active')
+		changeBib($(e.target).attr('value'))
+	})
+}
+
+function getBibUsageList(e, bibId) {
+	axios.get(`${publicUrl}/monitor/bib_usage/list`, {
+		params: {
+			start: (parseInt($(e.target).attr('value')) - 1) * 12,
+			to: (parseInt($(e.target).attr('value'))) * 12,
+			bibId: bibId
+		}
+	}).then(res => {
+		let tableList = res.data.data
+		for (let i = 0; i < tableList.length; i++) {
+			tableList[i].time = dateFormat('yyyy/mm/dd HH:MM:SS', new Date(tableList[i].createTime))
+			tableList[i].online = tableList[i].op ? (tableList[i].op === "load" ? '插入' : '取出') : ''
+		}
+		$("#bibTable").html(bibTableRender({dataList: tableList}))
+	})
+	$("#pagination").html(paginationRender({
+		maxPage: window.maxPage,
+		page: parseInt($(e.target).attr('value'))
+	}))
+}
+
+function bindClick(bibId) {
+	$("#pagination nav ul li").click((e) => {
+		getBibUsageList(e, bibId)
+		bindClick(bibId)
+	})
+}
+
+function changeBib(bibId) {
+	axios.get(`${publicUrl}/monitor/bib_usage/count`, {
+		params: {
+			bibId
+		}
+	}).then(res => {
+		window.maxPage = Math.ceil(res.data.data / 12)
+		$("#pagination").html(paginationRender({
+			maxPage: window.maxPage,
+			page: 1
+		}))
+		axios.get(`${publicUrl}/monitor/bib_usage/list`, {
+			params: {
+				start: 0,
+				to: 12,
+				bibId: bibId
+			}
+		}).then(res => {
+			let tableList = res.data.data
+			for (let i = 0; i < tableList.length; i++) {
+				tableList[i].time = dateFormat('yyyy/mm/dd HH:MM:SS', new Date(tableList[i].createTime))
+				tableList[i].online = tableList[i].op ? (tableList[i].op === "load" ? '插入' : '取出') : ''
+			}
+			$("#bibTable").html(bibTableRender({dataList: tableList}))
+		})
+		bindClick(bibId)
+	})
+}
+
+function setNewSelect(domId, data) {
+	$(`#${domId}`).html(selectRender(data));
+	$(`#${domId} .select-content`).click(() => {
+		$(`#${domId} .select-option`).attr('style', 'display:block');
+		$("body").one('mouseup', () => {
+			$(`#${domId} .select-option`).attr('style', 'display:none');
+		})
+	})
+
+	$(`input[name='${data.name}']:radio`).click(() => {
+		let val = $(`input[name='${data.name}']:radio:checked`).val();
+		let slotContent = $(`#${domId} .select-content`)
+		slotContent.attr('value', val);
+		changeBib(val)
+	})
+}
